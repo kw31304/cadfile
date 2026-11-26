@@ -482,6 +482,7 @@ def _is_outlook_process_running() -> bool:
             text=True,
             timeout=5,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return "OUTLOOK.EXE" in result.stdout.upper()
     except Exception:
