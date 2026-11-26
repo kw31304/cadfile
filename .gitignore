@@ -1,0 +1,12 @@
+# 預設忽略根目錄下所有檔案與信件附件資料夾（包含未來新增的廠商目錄）
+/*
+!.gitignore
+!/outlook_archiver/
+
+# 排除程式目錄內的虛擬環境、快取、日誌與防重複狀態資料庫
+/outlook_archiver/.venv/
+/outlook_archiver/__pycache__/
+/outlook_archiver/logs/
+*.log
+state.db
+*.py[cod]
