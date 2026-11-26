@@ -14,7 +14,9 @@ d:\圖檔\CAD\
 │   ├── SPEC.md                     # 本規格文件
 │   ├── rules.md                    # Markdown 分類規則設定檔（使用者可直接編輯）
 │   ├── outlook_archiver.py         # 主程式（讀取規則、連線 Outlook、分類下載附件）
+│   ├── outlook_archiver_gui.py     # PySide6 視覺操作介面
 │   ├── run_archiver.bat            # Windows 工作排程器呼叫用啟動腳本（設定 UTF-8 與工作目錄）
+│   ├── run_gui.bat                 # 啟動 PySide6 視覺介面腳本
 │   ├── state.db                    # 防重複下載紀錄檔（SQLite，自動產生）
 │   └── logs\
 │       └── archiver.log            # 執行日誌（自動輪替）

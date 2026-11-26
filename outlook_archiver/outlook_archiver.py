@@ -25,7 +25,12 @@ from typing import Any
 # ==============================================================================
 # 可調參數設定區（依實際需求調整）
 # ==============================================================================
-BASE_DIR = Path(__file__).resolve().parent
+APP_VERSION = "V1.0"
+BASE_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 RULES_FILE = BASE_DIR / "rules.md"
 OUTPUT_ROOT_DIR = Path(r"d:\圖檔\CAD")
 STATE_DB_PATH = BASE_DIR / "state.db"
@@ -43,7 +48,7 @@ TARGET_FOLDER_NAME: str | None = None
 DEFAULT_FOLDER = "其他未分類"
 
 # 掃描最近 N 天的信件（設為 None 代表不限天數，掃描全部信件）
-DAYS_BACK: int | None = 180
+DAYS_BACK: int | None = 7
 
 # 若 Outlook 尚未啟動，自動啟動後的最長等待秒數與輪詢間隔
 OUTLOOK_STARTUP_TIMEOUT = 45
@@ -113,7 +118,11 @@ _RULE_FIELD_ALIASES = {
 }
 
 
-def setup_logging(log_path: Path = LOG_FILE_PATH, verbose: bool = False) -> logging.Logger:
+def setup_logging(
+    log_path: Path = LOG_FILE_PATH,
+    verbose: bool = False,
+    extra_handlers: Sequence[logging.Handler] = (),
+) -> logging.Logger:
     """設定檔案輪替與主控台雙向日誌（UTF-8）。"""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("outlook_archiver")
@@ -135,10 +144,15 @@ def setup_logging(log_path: Path = LOG_FILE_PATH, verbose: bool = False) -> logg
     file_handler.setLevel(logging.DEBUG)
     logger.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
-    logger.addHandler(console_handler)
+    if sys.stdout is not None:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+        logger.addHandler(console_handler)
+
+    for handler in extra_handlers:
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
 
     return logger
 
@@ -209,6 +223,38 @@ def parse_rules_markdown(rules_path: Path) -> list[ClassificationRule]:
 
     flush_current()
     return rules
+
+
+def save_rules_markdown(rules_path: Path, rules: Sequence[ClassificationRule]) -> None:
+    """將分類規則清單序列化並寫回 rules.md。"""
+    lines = [
+        "# Outlook 附件自動分類規則",
+        "",
+        "> **使用說明**：",
+        "> - 程式會由上往下依序比對，採**兩階段比對**：",
+        ">   1. 第一階段先比對 **主旨包含**、**寄件人包含**、**Email包含**、**附件包含**（命中第一條即歸類停止）。",
+        ">   2. 若全部規則的前四項皆未命中，第二階段再比對 **內文包含**。",
+        "> - 同一區塊內的條件為 **OR** 邏輯，任一符合即成立（整封信內只要有任一有效附件檔名命中，整封信所有附件都會歸入該資料夾），英文不分大小寫。",
+        "> - 多個關鍵字請以半形逗號 `,` 或全形頓號 `、` 分隔，留空代表該欄位不比對。",
+        "",
+        "---",
+    ]
+    for rule in rules:
+        safe_name = sanitize_filename(rule.folder_name)
+        lines.extend(
+            [
+                "",
+                f"## {safe_name}",
+                f"- **主旨包含**: {', '.join(rule.subjects)}",
+                f"- **寄件人包含**: {', '.join(rule.senders)}",
+                f"- **Email包含**: {', '.join(rule.emails)}",
+                f"- **附件包含**: {', '.join(rule.attachments)}",
+                f"- **內文包含**: {', '.join(rule.bodies)}",
+            ]
+        )
+    lines.append("")
+    rules_path.parent.mkdir(parents=True, exist_ok=True)
+    rules_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def match_rule(
@@ -401,6 +447,25 @@ class StateStore:
                 (message_key, attachment_key, str(saved_path), target_folder, now_iso),
             )
 
+    def list_downloaded_attachments(self, limit: int = 500) -> list[tuple[str, str, str]]:
+        """依時間由新到舊回傳已下載附件清單 (processed_at, target_folder, saved_path)。"""
+        rows = self._conn.execute(
+            """
+            SELECT processed_at, target_folder, saved_path
+            FROM processed_attachments
+            ORDER BY processed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [(str(r[0]), str(r[1]), str(r[2])) for r in rows]
+
+    def clear_all(self) -> None:
+        """清空已檢查郵件與已下載附件紀錄。"""
+        with self._conn:
+            self._conn.execute("DELETE FROM processed_attachments")
+            self._conn.execute("DELETE FROM checked_messages")
+
     def close(self) -> None:
         self._conn.close()
 
@@ -450,6 +515,7 @@ def connect_outlook(
     """連接執行中的 Classic Outlook，若未開啟則自動啟動並輪詢等待初始化完成。"""
     import pythoncom  # type: ignore
     import win32com.client  # type: ignore
+    import win32timezone  # type: ignore  # noqa: F401  # COM 轉換 ReceivedTime 動態依賴此模組
 
     pythoncom.CoInitialize()
 
@@ -666,6 +732,8 @@ def process_mailbox(
     duplicate_mode: str = DUPLICATE_FILENAME_MODE,
     use_datetime_subfolder: bool = USE_DATETIME_SUBFOLDER,
     datetime_format: str = DATETIME_SUBFOLDER_FORMAT,
+    cancel_requested: Callable[[], bool] | None = None,
+    progress_callback: Callable[[dict[str, int], str], None] | None = None,
 ) -> dict[str, int]:
     """掃描指定資料夾內的郵件並依規則分類下載附件。"""
     stats = {
@@ -685,6 +753,10 @@ def process_mailbox(
     cutoff = datetime.now() - timedelta(days=days_back) if days_back is not None else None
 
     for item in items:
+        if cancel_requested and cancel_requested():
+            logger.warning("使用者已要求停止掃描。")
+            break
+
         if limit is not None and stats["scanned_mails"] >= limit:
             logger.info("已達測試上限 (%d 封)，停止掃描。", limit)
             break
@@ -812,9 +884,14 @@ def process_mailbox(
                 status = "downloaded" if valid_saved_in_mail > 0 else "no_valid_attachments"
                 state_store.mark_message_checked(message_key, subject, status)
 
+            if progress_callback:
+                progress_callback(dict(stats), subject)
+
         except Exception as exc:
             stats["errors"] += 1
             logger.exception("處理單封信件時發生錯誤：%s", exc)
+            if progress_callback:
+                progress_callback(dict(stats), "處理錯誤")
 
     return stats
 
@@ -843,6 +920,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="顯示詳細除錯日誌",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {APP_VERSION}",
+    )
     return parser
 
 
@@ -851,7 +933,12 @@ def main(argv: list[str] | None = None) -> int:
     logger = setup_logging(LOG_FILE_PATH, verbose=args.verbose)
     days_back = None if args.days == 0 else args.days
 
-    logger.info("=== 開始執行 Outlook 附件歸檔工具 (dry_run=%s, days_back=%s) ===", args.dry_run, days_back)
+    logger.info(
+        "=== 開始執行 Outlook 附件歸檔工具 %s (dry_run=%s, days_back=%s) ===",
+        APP_VERSION,
+        args.dry_run,
+        days_back,
+    )
 
     try:
         rules = parse_rules_markdown(RULES_FILE)

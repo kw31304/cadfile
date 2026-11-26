@@ -408,6 +408,32 @@ class TestOutlookArchiver(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_save_rules_markdown_roundtrip_and_state_store_helpers(self) -> None:
+        rules = [
+            oa.ClassificationRule("合宏展", ("合宏展",), ("潘金坤",), ("@hhj.com.tw",), ("HHJ",), ("案號",)),
+            oa.ClassificationRule("單井", (), ("籃梅菁",), ("singlewell",), (), ()),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rules_path = root / "rules.md"
+            oa.save_rules_markdown(rules_path, rules)
+            loaded = oa.parse_rules_markdown(rules_path)
+            self.assertEqual(loaded, rules)
+
+            store = oa.StateStore(root / "state.db")
+            try:
+                store.mark_attachment_downloaded("m1", "1:a.dwg:100", root / "a.dwg", "合宏展")
+                store.mark_message_checked("m1", "測試", "downloaded")
+                history = store.list_downloaded_attachments()
+                self.assertEqual(len(history), 1)
+                self.assertEqual(history[0][1], "合宏展")
+
+                store.clear_all()
+                self.assertEqual(store.list_downloaded_attachments(), [])
+                self.assertFalse(store.is_message_checked("m1"))
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

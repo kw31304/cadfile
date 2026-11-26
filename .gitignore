@@ -3,10 +3,14 @@
 !.gitignore
 !/outlook_archiver/
 
-# 排除程式目錄內的虛擬環境、快取、日誌與防重複狀態資料庫
+# 排除程式目錄內的虛擬環境、快取、日誌、打包產物與防重複狀態資料庫
 /outlook_archiver/.venv/
 /outlook_archiver/__pycache__/
 /outlook_archiver/logs/
+/outlook_archiver/build/
+/outlook_archiver/dist/
+*.exe
+*.spec
 *.log
 state.db
 *.py[cod]
