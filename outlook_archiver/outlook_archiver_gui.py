@@ -23,7 +23,6 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -579,19 +578,6 @@ class MainWindow(QMainWindow):
         self.account_edit = QLineEdit(oa.TARGET_ACCOUNT_EMAIL or "")
         self.account_edit.setPlaceholderText("留空使用 Outlook 預設帳號")
         cfg_grid.addWidget(self.account_edit, 1, 3, 1, 2)
-
-        opt_row = QHBoxLayout()
-        self.ignore_inline_chk = QCheckBox("排除簽名檔內嵌小圖")
-        self.ignore_inline_chk.setChecked(oa.IGNORE_INLINE_IMAGES)
-        self.datetime_subdir_chk = QCheckBox("依收件日期時間建子資料夾 (YYYY-MM-DD_AMHHMM)")
-        self.datetime_subdir_chk.setChecked(oa.USE_DATETIME_SUBFOLDER)
-        self.save_email_html_chk = QCheckBox("產生信件紀錄檔 (.html)")
-        self.save_email_html_chk.setChecked(oa.SAVE_EMAIL_HTML)
-        opt_row.addWidget(self.ignore_inline_chk)
-        opt_row.addWidget(self.datetime_subdir_chk)
-        opt_row.addWidget(self.save_email_html_chk)
-        opt_row.addStretch()
-        cfg_grid.addLayout(opt_row, 2, 0, 1, 5)
         layout.addWidget(cfg_box)
 
         # 按鈕列
@@ -890,9 +876,9 @@ class MainWindow(QMainWindow):
             days_back=days_back,
             account_email=account,
             output_root=output_root,
-            ignore_inline=self.ignore_inline_chk.isChecked(),
-            use_datetime_subfolder=self.datetime_subdir_chk.isChecked(),
-            save_email_html=self.save_email_html_chk.isChecked(),
+            ignore_inline=oa.IGNORE_INLINE_IMAGES,
+            use_datetime_subfolder=oa.USE_DATETIME_SUBFOLDER,
+            save_email_html=oa.SAVE_EMAIL_HTML,
         )
         self.worker.log_received.connect(self._append_log_line)
         self.worker.progress_updated.connect(self._on_progress_updated)
