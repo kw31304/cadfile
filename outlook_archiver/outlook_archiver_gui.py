@@ -437,9 +437,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Outlook 附件自動分類歸檔工具 {oa.APP_VERSION}")
         self.resize(1040, 720)
         self.worker: ArchiveWorker | None = None
-        self.rules: list[oa.ClassificationRule] = []
-        self._report_records: list[oa.ArchiveReportRecord] = []
-        self._filtered_report_records: list[oa.ArchiveReportRecord] = []
+        self.rules: list[oa.ClassificationRule] = [] # type: ignore
+        self._report_records: list[oa.ArchiveReportRecord] = [] # type: ignore
+        self._filtered_report_records: list[oa.ArchiveReportRecord] = [] # type: ignore
         self._syncing_rule_form = False
 
         self.settings = QSettings("OutlookArchiver", "CADTool")
