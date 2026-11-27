@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+from datetime import datetime
 import importlib.util
 import logging
 from pathlib import Path
@@ -9,7 +11,16 @@ import re
 import sys
 
 from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QTextCharFormat, QTextCursor
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QKeySequence,
+    QShortcut,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -26,14 +37,15 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
     QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -90,6 +102,7 @@ class ArchiveWorker(QThread):
         output_root: Path,
         ignore_inline: bool,
         use_datetime_subfolder: bool,
+        save_email_html: bool,
     ) -> None:
         super().__init__()
         self.dry_run = dry_run
@@ -98,6 +111,7 @@ class ArchiveWorker(QThread):
         self.output_root = output_root
         self.ignore_inline = ignore_inline
         self.use_datetime_subfolder = use_datetime_subfolder
+        self.save_email_html = save_email_html
         self._cancel_flag = False
 
     def request_cancel(self) -> None:
@@ -141,6 +155,7 @@ class ArchiveWorker(QThread):
                 days_back=self.days_back,
                 ignore_inline_images=self.ignore_inline,
                 use_datetime_subfolder=self.use_datetime_subfolder,
+                save_email_html=self.save_email_html,
                 cancel_requested=lambda: self._cancel_flag,
                 progress_callback=lambda s, subj: self.progress_updated.emit(s, subj),
             )
@@ -282,7 +297,7 @@ def _build_stylesheet(t: dict[str, str]) -> str:
             padding: 0 6px;
             color: {t["text"]};
         }}
-        QLineEdit, QSpinBox, QComboBox, QListWidget, QTableWidget, QPlainTextEdit {{
+        QLineEdit, QSpinBox, QComboBox, QListWidget, QTreeWidget, QPlainTextEdit {{
             background-color: {t["input_bg"]};
             color: {t["text"]};
             border: 1px solid {t["input_border"]};
@@ -291,7 +306,7 @@ def _build_stylesheet(t: dict[str, str]) -> str:
             selection-background-color: {t["table_selection_bg"]};
             selection-color: {t["table_selection_text"]};
         }}
-        QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QListWidget:focus {{
+        QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QListWidget:focus, QTreeWidget:focus {{
             border-color: {t["primary"]};
         }}
         QComboBox QAbstractItemView {{
@@ -309,8 +324,21 @@ def _build_stylesheet(t: dict[str, str]) -> str:
             padding: 6px 8px;
             font-weight: 600;
         }}
-        QTableWidget {{
-            gridline-color: {t["border"]};
+        QTreeWidget {{
+            alternate-background-color: {t["surface_bg"]};
+        }}
+        QTreeWidget::item:selected {{
+            background-color: {t["table_selection_bg"]};
+            color: {t["table_selection_text"]};
+        }}
+        QMenu {{
+            background-color: {t["surface_bg"]};
+            color: {t["text"]};
+            border: 1px solid {t["border"]};
+        }}
+        QMenu::item:selected {{
+            background-color: {t["table_selection_bg"]};
+            color: {t["table_selection_text"]};
         }}
         QPushButton {{
             background-color: {t["btn_bg"]};
@@ -411,6 +439,8 @@ class MainWindow(QMainWindow):
         self.resize(1040, 720)
         self.worker: ArchiveWorker | None = None
         self.rules: list[oa.ClassificationRule] = []
+        self._report_records: list[oa.ArchiveReportRecord] = []
+        self._filtered_report_records: list[oa.ArchiveReportRecord] = []
         self._syncing_rule_form = False
 
         self.settings = QSettings("OutlookArchiver", "CADTool")
@@ -514,7 +544,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_runner_tab(), "執行與監控")
         self.tabs.addTab(self._build_rules_tab(), "分類規則設定 (rules.md)")
-        self.tabs.addTab(self._build_history_tab(), "已歸檔紀錄")
+        self.tabs.addTab(self._build_history_tab(), "已歸檔報表")
         root_layout.addWidget(self.tabs)
 
     # ------------------------------------------------------------------
@@ -555,8 +585,11 @@ class MainWindow(QMainWindow):
         self.ignore_inline_chk.setChecked(oa.IGNORE_INLINE_IMAGES)
         self.datetime_subdir_chk = QCheckBox("依收件日期時間建子資料夾 (YYYY-MM-DD_AMHHMM)")
         self.datetime_subdir_chk.setChecked(oa.USE_DATETIME_SUBFOLDER)
+        self.save_email_html_chk = QCheckBox("產生信件紀錄檔 (.html)")
+        self.save_email_html_chk.setChecked(oa.SAVE_EMAIL_HTML)
         opt_row.addWidget(self.ignore_inline_chk)
         opt_row.addWidget(self.datetime_subdir_chk)
+        opt_row.addWidget(self.save_email_html_chk)
         opt_row.addStretch()
         cfg_grid.addLayout(opt_row, 2, 0, 1, 5)
         layout.addWidget(cfg_box)
@@ -703,7 +736,7 @@ class MainWindow(QMainWindow):
         return tab
 
     # ------------------------------------------------------------------
-    # Tab 3: 已歸檔紀錄
+    # Tab 3: 已歸檔報表（依廠商 - 收件日期時間分類）
     # ------------------------------------------------------------------
     def _build_history_tab(self) -> QWidget:
         tab = QWidget()
@@ -711,32 +744,102 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        top_row = QHBoxLayout()
+        # 篩選與智慧搜尋區
+        filter_box = QGroupBox("報表篩選與智慧搜尋（同時支援關鍵字與日期時間數字）")
+        filter_layout = QVBoxLayout(filter_box)
+        filter_layout.setSpacing(6)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("廠商："))
+        self.history_vendor_combo = QComboBox()
+        self.history_vendor_combo.setMinimumWidth(130)
+        self.history_vendor_combo.addItem("全部廠商", "")
+        self.history_vendor_combo.currentIndexChanged.connect(self._render_history_report)
+        row1.addWidget(self.history_vendor_combo)
+
+        row1.addWidget(QLabel("智慧搜尋："))
         self.history_search_edit = QLineEdit()
-        self.history_search_edit.setPlaceholderText("搜尋分類資料夾或檔案路徑...")
-        self.history_search_edit.textChanged.connect(self._filter_history_rows)
+        self.history_search_edit.setClearButtonEnabled(True)
+        self.history_search_edit.setPlaceholderText(
+            "輸入關鍵字或數字日期時間（例：4070、10220240、10221440、單井 11200345）..."
+        )
+        self.history_search_edit.textChanged.connect(self._render_history_report)
+        row1.addWidget(self.history_search_edit, stretch=1)
+
+        today_btn = QPushButton("今天")
+        today_btn.clicked.connect(lambda: self._insert_quick_search(datetime.now().strftime("%Y%m%d")))
+        now_btn = QPushButton("目前 ±5分")
+        now_btn.clicked.connect(lambda: self._insert_quick_search(datetime.now().strftime("%Y%m%d%H%M")))
 
         refresh_btn = QPushButton("↻ 重新整理")
         refresh_btn.clicked.connect(self._load_history_table)
-
-        reset_db_btn = QPushButton("🗑 清空防重複紀錄 (state.db)")
+        export_btn = QPushButton("📤 匯出 CSV")
+        export_btn.clicked.connect(self._export_history_csv)
+        reset_db_btn = QPushButton("🗑 清空防重複紀錄")
         reset_db_btn.setObjectName("DangerBtn")
         reset_db_btn.clicked.connect(self._clear_state_db)
 
-        top_row.addWidget(self.history_search_edit, stretch=1)
-        top_row.addWidget(refresh_btn)
-        top_row.addWidget(reset_db_btn)
-        layout.addLayout(top_row)
+        row1.addWidget(today_btn)
+        row1.addWidget(now_btn)
+        row1.addWidget(refresh_btn)
+        row1.addWidget(export_btn)
+        row1.addWidget(reset_db_btn)
+        filter_layout.addLayout(row1)
 
-        self.history_table = QTableWidget(0, 3)
-        self.history_table.setHorizontalHeaderLabels(["歸檔時間", "分類資料夾", "儲存檔案路徑（雙擊可開啟檔案）"])
-        self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.history_table.cellDoubleClicked.connect(self._open_history_item)
-        layout.addWidget(self.history_table, stretch=1)
+        self.history_search_hint_label = QLabel("")
+        self.history_search_hint_label.setStyleSheet("font-size: 12px;")
+        self.history_search_hint_label.setVisible(False)
+        filter_layout.addWidget(self.history_search_hint_label)
+
+        layout.addWidget(filter_box)
+
+        # 報表摘要與操作列
+        summary_row = QHBoxLayout()
+        self.history_summary_label = QLabel("報表統計：0 家廠商 ｜ 0 筆時間批次 ｜ 0 個檔案")
+        self.history_summary_label.setStyleSheet("font-weight: 600;")
+
+        expand_all_btn = QPushButton("展開全部")
+        expand_all_btn.clicked.connect(lambda: self.history_tree.expandAll())
+        collapse_all_btn = QPushButton("收合全部")
+        collapse_all_btn.clicked.connect(lambda: self.history_tree.collapseAll())
+        open_folder_btn = QPushButton("開啟選取資料夾")
+        open_folder_btn.clicked.connect(self._open_selected_history_folder)
+        open_html_btn = QPushButton("查看信件內容 (.html)")
+        open_html_btn.clicked.connect(self._open_selected_history_html)
+
+        summary_row.addWidget(self.history_summary_label)
+        summary_row.addStretch()
+        summary_row.addWidget(expand_all_btn)
+        summary_row.addWidget(collapse_all_btn)
+        summary_row.addWidget(open_folder_btn)
+        summary_row.addWidget(open_html_btn)
+        layout.addLayout(summary_row)
+
+        # 廠商 - 日期時間樹狀報表
+        self.history_tree = QTreeWidget()
+        self.history_tree.setColumnCount(5)
+        self.history_tree.setHeaderLabels(
+            ["廠商 / 收件批次 / 檔名", "副檔名", "收件日期時間", "數量 / 歸檔時間", "完整路徑（雙擊檔案開啟）"]
+        )
+        self.history_tree.setAlternatingRowColors(True)
+        self.history_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        self.history_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.history_tree.customContextMenuRequested.connect(self._show_history_context_menu)
+        self.history_tree.itemDoubleClicked.connect(self._open_history_item)
+
+        copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.history_tree)
+        copy_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        copy_shortcut.activated.connect(self._copy_selected_history_text)
+
+        header = self.history_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.history_tree.setColumnWidth(0, 280)
+
+        layout.addWidget(self.history_tree, stretch=1)
 
         return tab
 
@@ -789,6 +892,7 @@ class MainWindow(QMainWindow):
             output_root=output_root,
             ignore_inline=self.ignore_inline_chk.isChecked(),
             use_datetime_subfolder=self.datetime_subdir_chk.isChecked(),
+            save_email_html=self.save_email_html_chk.isChecked(),
         )
         self.worker.log_received.connect(self._append_log_line)
         self.worker.progress_updated.connect(self._on_progress_updated)
@@ -972,45 +1076,278 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "儲存失敗", f"寫入 rules.md 時發生錯誤：{exc}")
 
     # ------------------------------------------------------------------
-    # 歸檔紀錄檢視器
+    # 歸檔報表檢視器
     # ------------------------------------------------------------------
     def _load_history_table(self) -> None:
         rows: list[tuple[str, str, str]] = []
         if oa.STATE_DB_PATH.exists():
             store = oa.StateStore(oa.STATE_DB_PATH)
             try:
-                rows = store.list_downloaded_attachments(limit=500)
+                rows = store.list_downloaded_attachments(limit=5000)
             finally:
                 store.close()
 
-        self.history_table.setRowCount(len(rows))
-        for r_idx, (ts, folder, path_str) in enumerate(rows):
-            self.history_table.setItem(r_idx, 0, QTableWidgetItem(ts))
-            self.history_table.setItem(r_idx, 1, QTableWidgetItem(folder))
-            self.history_table.setItem(r_idx, 2, QTableWidgetItem(path_str))
-        self._filter_history_rows(self.history_search_edit.text())
+        self._report_records = oa.build_archive_report_records(rows)
+        self._refresh_vendor_filter_options()
+        self._render_history_report()
 
-    def _filter_history_rows(self, keyword: str) -> None:
-        kw = keyword.strip().lower()
-        for r_idx in range(self.history_table.rowCount()):
-            if not kw:
-                self.history_table.setRowHidden(r_idx, False)
-                continue
-            folder_text = (self.history_table.item(r_idx, 1).text() or "").lower()
-            path_text = (self.history_table.item(r_idx, 2).text() or "").lower()
-            self.history_table.setRowHidden(r_idx, kw not in folder_text and kw not in path_text)
+    def _refresh_vendor_filter_options(self) -> None:
+        current_vendor = str(self.history_vendor_combo.currentData() or "")
+        vendors = sorted({rec.vendor for rec in self._report_records})
+        self.history_vendor_combo.blockSignals(True)
+        self.history_vendor_combo.clear()
+        self.history_vendor_combo.addItem("全部廠商", "")
+        for vendor in vendors:
+            self.history_vendor_combo.addItem(vendor, vendor)
+        idx = self.history_vendor_combo.findData(current_vendor)
+        self.history_vendor_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.history_vendor_combo.blockSignals(False)
 
-    def _open_history_item(self, row: int, _col: int) -> None:
-        item = self.history_table.item(row, 2)
-        if not item:
-            return
-        file_path = Path(item.text())
-        if file_path.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(file_path)))
-        elif file_path.parent.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(file_path.parent)))
+    def _insert_quick_search(self, date_token: str) -> None:
+        parsed = oa.parse_unified_report_query(self.history_search_edit.text(), tolerance_minutes=5)
+        parts = [*parsed.keywords, date_token]
+        self.history_search_edit.setText(" ".join(parts))
+
+    def _render_history_report(self) -> None:
+        vendor = str(self.history_vendor_combo.currentData() or "") or None
+        parsed = oa.parse_unified_report_query(self.history_search_edit.text(), tolerance_minutes=5)
+
+        if parsed.status_text:
+            self.history_search_hint_label.setText(parsed.status_text)
+            color = (
+                self._active_theme["log_success"]
+                if parsed.has_datetime_filter
+                else self._active_theme["muted_text"]
+            )
+            self.history_search_hint_label.setStyleSheet(f"font-size: 12px; color: {color};")
+            self.history_search_hint_label.setVisible(True)
         else:
-            QMessageBox.warning(self, "檔案不存在", f"找不到檔案或目錄：\n{file_path}")
+            self.history_search_hint_label.setVisible(False)
+
+        filtered = oa.filter_archive_report_records(
+            self._report_records,
+            vendor=vendor,
+            keywords=parsed.keywords,
+            time_windows=parsed.time_windows or None,
+        )
+        self._filtered_report_records = filtered
+        grouped = oa.group_report_by_vendor_date(filtered)
+
+        self.history_tree.clear()
+        total_batches = 0
+        bold_font = QFont(self.history_tree.font())
+        bold_font.setBold(True)
+
+        for vendor_name, batches in grouped:
+            vendor_file_count = sum(len(items) for _, _, items in batches)
+            total_batches += len(batches)
+            vendor_dir = str(Path(batches[0][2][0].saved_path).parent.parent) if batches else ""
+
+            vendor_item = QTreeWidgetItem(
+                [
+                    f"📁 {vendor_name}",
+                    "",
+                    "",
+                    f"共 {len(batches)} 批 / {vendor_file_count} 檔",
+                    vendor_dir,
+                ]
+            )
+            vendor_item.setFont(0, bold_font)
+            vendor_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "vendor", "path": vendor_dir})
+
+            for batch_label, batch_dt, items in batches:
+                dt_display = batch_dt.strftime("%Y-%m-%d %H:%M") if batch_dt else batch_label
+                batch_dir = str(Path(items[0].saved_path).parent)
+                html_candidate = Path(batch_dir) / oa.EMAIL_HTML_FILENAME
+                batch_prefix = "🕒" if not html_candidate.exists() else "✉"
+
+                batch_item = QTreeWidgetItem(
+                    [
+                        f"{batch_prefix} {batch_label}",
+                        "",
+                        dt_display,
+                        f"{len(items)} 檔",
+                        batch_dir,
+                    ]
+                )
+                batch_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "batch", "path": batch_dir})
+
+                for rec in items:
+                    rec_dt_str = rec.received_dt.strftime("%Y-%m-%d %H:%M") if rec.received_dt else rec.batch_label
+                    archived_str = rec.archived_at.replace("T", " ")
+                    file_path_obj = Path(rec.filename)
+                    file_item = QTreeWidgetItem(
+                        [
+                            file_path_obj.stem,
+                            file_path_obj.suffix,
+                            rec_dt_str,
+                            archived_str,
+                            rec.saved_path,
+                        ]
+                    )
+                    file_item.setData(
+                        0,
+                        Qt.ItemDataRole.UserRole,
+                        {"type": "file", "path": rec.saved_path, "filename": rec.filename, "stem": file_path_obj.stem},
+                    )
+                    batch_item.addChild(file_item)
+
+                vendor_item.addChild(batch_item)
+
+            self.history_tree.addTopLevelItem(vendor_item)
+            has_active_filter = bool(self.history_search_edit.text().strip() or vendor is not None)
+            if has_active_filter:
+                vendor_item.setExpanded(True)
+                for b_idx in range(min(vendor_item.childCount(), 5)):
+                    vendor_item.child(b_idx).setExpanded(True)
+
+        self.history_summary_label.setText(
+            f"報表統計：{len(grouped)} 家廠商 ｜ {total_batches} 筆時間批次 ｜ {len(filtered)} 個檔案"
+        )
+
+    def _get_selected_node_info(self) -> dict[str, str] | None:
+        item = self.history_tree.currentItem()
+        if item is None:
+            return None
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        return data if isinstance(data, dict) else None
+
+    def _open_local_path(self, target_path: Path) -> None:
+        if target_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target_path)))
+        elif target_path.parent.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target_path.parent)))
+        else:
+            QMessageBox.warning(self, "路徑不存在", f"找不到檔案或目錄：\n{target_path}")
+
+    def _open_history_item(self, item: QTreeWidgetItem, _col: int) -> None:
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        if data.get("type") == "file":
+            self._open_local_path(Path(data["path"]))
+
+    def _open_selected_history_folder(self) -> None:
+        info = self._get_selected_node_info()
+        if not info:
+            QMessageBox.information(self, "提示", "請先在下方報表中點選一筆廠商、批次或檔案。")
+            return
+        p = Path(info["path"])
+        target_dir = p.parent if info.get("type") == "file" else p
+        self._open_local_path(target_dir)
+
+    def _open_selected_history_html(self) -> None:
+        info = self._get_selected_node_info()
+        if not info:
+            QMessageBox.information(self, "提示", "請先點選一筆時間批次或檔案。")
+            return
+        p = Path(info["path"])
+        if info.get("type") == "vendor":
+            QMessageBox.information(self, "提示", "請展開廠商節點，點選底下的日期時間批次或檔案。")
+            return
+        batch_dir = p.parent if info.get("type") == "file" else p
+        html_file = batch_dir / oa.EMAIL_HTML_FILENAME
+        if html_file.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(html_file)))
+        else:
+            QMessageBox.information(self, "未找到信件紀錄", f"此批次資料夾尚未產生 {oa.EMAIL_HTML_FILENAME}：\n{batch_dir}")
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(text)
+            self.status_label.setText(f"已複製：{text}")
+
+    def _copy_selected_history_text(self) -> None:
+        item = self.history_tree.currentItem()
+        if item is None:
+            return
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict) and data.get("type") == "file":
+            self._copy_to_clipboard(data.get("stem", item.text(0)))
+        else:
+            self._copy_to_clipboard(item.text(0))
+
+    def _show_history_context_menu(self, pos) -> None:
+        item = self.history_tree.itemAt(pos)
+        if item is None:
+            return
+        self.history_tree.setCurrentItem(item)
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+
+        menu = QMenu(self)
+        node_type = data.get("type")
+        if node_type == "file":
+            open_file_act = QAction("開啟檔案", self)
+            open_file_act.triggered.connect(lambda: self._open_local_path(Path(data["path"])))
+            menu.addAction(open_file_act)
+
+            copy_stem_act = QAction("複製檔名（不含副檔名）", self)
+            copy_stem_act.triggered.connect(lambda: self._copy_to_clipboard(data.get("stem", item.text(0))))
+            menu.addAction(copy_stem_act)
+
+            copy_name_act = QAction("複製完整檔名", self)
+            copy_name_act.triggered.connect(lambda: self._copy_to_clipboard(data.get("filename", "")))
+            menu.addAction(copy_name_act)
+
+            copy_path_act = QAction("複製完整路徑", self)
+            copy_path_act.triggered.connect(lambda: self._copy_to_clipboard(data.get("path", "")))
+            menu.addAction(copy_path_act)
+            menu.addSeparator()
+
+        open_dir_act = QAction("開啟所在資料夾", self)
+        open_dir_act.triggered.connect(self._open_selected_history_folder)
+        menu.addAction(open_dir_act)
+
+        if node_type in ("batch", "file"):
+            open_html_act = QAction("查看信件內容 (.html)", self)
+            open_html_act.triggered.connect(self._open_selected_history_html)
+            menu.addAction(open_html_act)
+
+        menu.exec(self.history_tree.viewport().mapToGlobal(pos))
+
+    def _export_history_csv(self) -> None:
+        if not self._filtered_report_records:
+            QMessageBox.information(self, "無資料可匯出", "目前篩選結果沒有已歸檔紀錄。")
+            return
+
+        default_name = f"歸檔報表_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "匯出已歸檔報表 (CSV)",
+            str(oa.OUTPUT_ROOT_DIR / default_name),
+            "CSV 檔案 (*.csv)",
+        )
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["廠商名稱", "收件批次", "收件日期時間", "檔名", "副檔名", "歸檔時間", "完整路徑"])
+                for rec in self._filtered_report_records:
+                    dt_str = rec.received_dt.strftime("%Y-%m-%d %H:%M") if rec.received_dt else rec.batch_label
+                    p_name = Path(rec.filename)
+                    writer.writerow(
+                        [
+                            rec.vendor,
+                            rec.batch_label,
+                            dt_str,
+                            p_name.stem,
+                            p_name.suffix,
+                            rec.archived_at.replace("T", " "),
+                            rec.saved_path,
+                        ]
+                    )
+            QMessageBox.information(
+                self,
+                "匯出完成",
+                f"已匯出 {len(self._filtered_report_records)} 筆紀錄至：\n{save_path}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "匯出失敗", f"無法儲存 CSV 檔案：\n{exc}")
 
     def _clear_state_db(self) -> None:
         if self.worker and self.worker.isRunning():

@@ -13,4 +13,5 @@
 *.spec
 *.log
 state.db
+state.db-*
 *.py[cod]

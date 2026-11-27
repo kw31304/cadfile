@@ -10,6 +10,7 @@ import argparse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import html
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -21,11 +22,12 @@ import subprocess
 import sys
 import time
 from typing import Any
+from urllib.parse import quote
 
 # ==============================================================================
 # 可調參數設定區（依實際需求調整）
 # ==============================================================================
-APP_VERSION = "V1.0"
+APP_VERSION = "V1.1"
 BASE_DIR = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
@@ -70,6 +72,10 @@ DUPLICATE_FILENAME_MODE = "suffix_counter"
 # 是否依收件日期時間在分類資料夾底下建立子資料夾（例如 合宏展\2026-11-26_AM0938\）
 USE_DATETIME_SUBFOLDER = True
 DATETIME_SUBFOLDER_FORMAT = "%Y-%m-%d_%p%I%M"
+
+# 是否在子資料夾內產生輕量信件紀錄檔 (.html)，記錄主旨/寄件人/時間/內文
+SAVE_EMAIL_HTML = True
+EMAIL_HTML_FILENAME = "_信件內容.html"
 
 # ==============================================================================
 # 常數與 MAPI Property Tags
@@ -470,6 +476,343 @@ class StateStore:
         self._conn.close()
 
 
+@dataclass(frozen=True)
+class ArchiveReportRecord:
+    """供報表檢視與篩選用的單筆已歸檔紀錄。"""
+
+    vendor: str
+    batch_label: str
+    received_dt: datetime | None
+    archived_at: str
+    saved_path: str
+    filename: str
+
+
+_SUBFOLDER_DT_FORMATS = ("%Y-%m-%d_%p%I%M", "%Y-%m-%d_%H%M%S", "%Y-%m-%d")
+
+
+def parse_received_dt_from_path(saved_path: str, archived_at: str) -> tuple[str, datetime | None]:
+    """從儲存路徑的子資料夾名稱解析收件日期時間，失敗時退回歸檔時間。"""
+    parent_name = Path(saved_path).parent.name
+    for fmt in _SUBFOLDER_DT_FORMATS:
+        try:
+            parsed = datetime.strptime(parent_name, fmt)
+            return parent_name, parsed
+        except ValueError:
+            continue
+
+    try:
+        fallback_dt = datetime.fromisoformat(archived_at)
+        return fallback_dt.strftime("%Y-%m-%d"), fallback_dt.replace(tzinfo=None)
+    except Exception:
+        return parent_name or "未知日期", None
+
+
+def build_archive_report_records(rows: Sequence[tuple[str, str, str]]) -> list[ArchiveReportRecord]:
+    """將 StateStore 查詢列轉換為報表紀錄物件列表。"""
+    records: list[ArchiveReportRecord] = []
+    for archived_at, vendor, saved_path in rows:
+        batch_label, received_dt = parse_received_dt_from_path(saved_path, archived_at)
+        records.append(
+            ArchiveReportRecord(
+                vendor=vendor or DEFAULT_FOLDER,
+                batch_label=batch_label,
+                received_dt=received_dt,
+                archived_at=archived_at,
+                saved_path=saved_path,
+                filename=Path(saved_path).name,
+            )
+        )
+    return records
+
+
+@dataclass(frozen=True)
+class SmartDateFilterResult:
+    """智慧數字日期／時間輸入解析結果。"""
+
+    is_valid: bool
+    windows: tuple[tuple[datetime, datetime], ...]
+    status_text: str
+
+
+def _build_am_pm_windows(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    minute: int,
+    tolerance_minutes: int,
+) -> tuple[tuple[tuple[datetime, datetime], ...], str]:
+    """依小時是否屬於 1~12 智慧展開 AM/PM 前後 N 分鐘搜尋區間。"""
+    base_dt = datetime(year, month, day, hour, minute)
+    delta = timedelta(minutes=tolerance_minutes)
+    candidates = [base_dt]
+    if 1 <= hour <= 11:
+        candidates.append(base_dt.replace(hour=hour + 12))
+    elif hour == 12:
+        candidates.insert(0, base_dt.replace(hour=0))
+
+    windows: list[tuple[datetime, datetime]] = []
+    desc_parts: list[str] = []
+    for dt in candidates:
+        start = (dt - delta).replace(second=0, microsecond=0)
+        end = (dt + delta).replace(second=59, microsecond=999999)
+        windows.append((start, end))
+        desc_parts.append(f"{start.strftime('%Y-%m-%d %H:%M')}~{end.strftime('%H:%M')}")
+    return tuple(windows), " 或 ".join(desc_parts)
+
+
+def parse_smart_datetime_windows(
+    raw_text: str,
+    tolerance_minutes: int = 5,
+    reference_dt: datetime | None = None,
+) -> SmartDateFilterResult:
+    """解析數字型日期時間輸入並回傳前後 N 分鐘的篩選區間。
+
+    支援格式：
+    - 12 碼 `YYYYMMDDHHMM`（如 202610220240 / 202610221440）
+    - 10 碼 `YYMMDDHHMM`（如 2610221440）
+    - 8 碼 `YYYYMMDD`（若以 19/20 開頭，搜尋該日全天）或 `MMDDHHMM`（省略年份，如 10220240 / 10221440）
+    - 6 碼 `YYMMDD`（搜尋該日全天）
+    - 4 碼 `MMDD`（省略年份，搜尋該日全天）
+    """
+    stripped = raw_text.strip()
+    if not stripped:
+        return SmartDateFilterResult(is_valid=True, windows=(), status_text="")
+
+    digits = re.sub(r"[-/:_\s]+", "", stripped)
+    if not digits.isdigit():
+        return SmartDateFilterResult(
+            is_valid=False,
+            windows=(),
+            status_text="請輸入數字日期時間（例：202610220240、10221440、20261022）",
+        )
+
+    ref_year = (reference_dt or datetime.now()).year
+    length = len(digits)
+
+    try:
+        if length == 12:
+            y, m, d, hh, mm = (
+                int(digits[0:4]),
+                int(digits[4:6]),
+                int(digits[6:8]),
+                int(digits[8:10]),
+                int(digits[10:12]),
+            )
+            windows, desc = _build_am_pm_windows(y, m, d, hh, mm, tolerance_minutes)
+            return SmartDateFilterResult(is_valid=True, windows=windows, status_text=f"條件：{desc}")
+
+        if length == 10:
+            y, m, d, hh, mm = (
+                2000 + int(digits[0:2]),
+                int(digits[2:4]),
+                int(digits[4:6]),
+                int(digits[6:8]),
+                int(digits[8:10]),
+            )
+            windows, desc = _build_am_pm_windows(y, m, d, hh, mm, tolerance_minutes)
+            return SmartDateFilterResult(is_valid=True, windows=windows, status_text=f"條件：{desc}")
+
+        if length == 8:
+            if digits.startswith(("19", "20")):
+                y, m, d = int(digits[0:4]), int(digits[4:6]), int(digits[6:8])
+                day_start = datetime(y, m, d, 0, 0, 0)
+                day_end = datetime(y, m, d, 23, 59, 59, 999999)
+                return SmartDateFilterResult(
+                    is_valid=True,
+                    windows=((day_start, day_end),),
+                    status_text=f"條件：{day_start.strftime('%Y-%m-%d')} 全日",
+                )
+            m, d, hh, mm = (
+                int(digits[0:2]),
+                int(digits[2:4]),
+                int(digits[4:6]),
+                int(digits[6:8]),
+            )
+            windows, desc = _build_am_pm_windows(ref_year, m, d, hh, mm, tolerance_minutes)
+            return SmartDateFilterResult(is_valid=True, windows=windows, status_text=f"條件：{desc}")
+
+        if length == 6:
+            y, m, d = 2000 + int(digits[0:2]), int(digits[2:4]), int(digits[4:6])
+            day_start = datetime(y, m, d, 0, 0, 0)
+            day_end = datetime(y, m, d, 23, 59, 59, 999999)
+            return SmartDateFilterResult(
+                is_valid=True,
+                windows=((day_start, day_end),),
+                status_text=f"條件：{day_start.strftime('%Y-%m-%d')} 全日",
+            )
+
+        if length == 4:
+            m, d = int(digits[0:2]), int(digits[2:4])
+            day_start = datetime(ref_year, m, d, 0, 0, 0)
+            day_end = datetime(ref_year, m, d, 23, 59, 59, 999999)
+            return SmartDateFilterResult(
+                is_valid=True,
+                windows=((day_start, day_end),),
+                status_text=f"條件：{day_start.strftime('%Y-%m-%d')} 全日",
+            )
+    except ValueError:
+        return SmartDateFilterResult(
+            is_valid=False,
+            windows=(),
+            status_text="日期或時間數值無效，請檢查月份、日期與小時分鐘",
+        )
+
+    return SmartDateFilterResult(
+        is_valid=False,
+        windows=(),
+        status_text="請輸入 4/8/12 碼數字（例：1022、10220240、10221440、202610220240）",
+    )
+
+
+@dataclass(frozen=True)
+class UnifiedReportQuery:
+    """整合式搜尋框的智慧解析結果（同時支援關鍵字與數字日期時間）。"""
+
+    keywords: tuple[str, ...]
+    time_windows: tuple[tuple[datetime, datetime], ...]
+    status_text: str
+    has_datetime_filter: bool
+
+
+_DATE_LIKE_TOKEN_RE = re.compile(r"^[\d\-/:_]+$")
+_DATE_LIKE_FULL_RE = re.compile(r"^[\d\-/:_\s]+$")
+
+
+def parse_unified_report_query(
+    raw_text: str,
+    tolerance_minutes: int = 5,
+    reference_dt: datetime | None = None,
+) -> UnifiedReportQuery:
+    """同時解析混合關鍵字與數字日期／時間的搜尋輸入。
+
+    例如：
+    - '202610220240' / '10221440' / '2026-10-22 14:40' -> 純日期時間 ±5 分鐘篩選
+    - '單井 11200345' -> 同時篩選廠商/檔名含 '單井' 且時間在 11/20 03:40±5分 或 15:40±5分
+    - '4070' -> 無法構成有效日期時間，自動當作關鍵字搜尋（如 A050-4070.stp）
+    """
+    stripped = raw_text.strip()
+    if not stripped:
+        return UnifiedReportQuery(keywords=(), time_windows=(), status_text="", has_datetime_filter=False)
+
+    # 若整體僅由數字與日期分隔符組成，優先嘗試整體作為日期時間解析（支援 '2026-10-22 14:40'）
+    if _DATE_LIKE_FULL_RE.fullmatch(stripped):
+        whole_res = parse_smart_datetime_windows(
+            stripped,
+            tolerance_minutes=tolerance_minutes,
+            reference_dt=reference_dt,
+        )
+        if whole_res.is_valid and whole_res.windows:
+            desc = whole_res.status_text.removeprefix("條件：")
+            return UnifiedReportQuery(
+                keywords=(),
+                time_windows=whole_res.windows,
+                status_text=f"智慧辨識日期時間：{desc}",
+                has_datetime_filter=True,
+            )
+
+    keywords: list[str] = []
+    windows: list[tuple[datetime, datetime]] = []
+    date_descs: list[str] = []
+
+    for token in stripped.split():
+        if _DATE_LIKE_TOKEN_RE.fullmatch(token):
+            digits = re.sub(r"[-/:_]+", "", token)
+            if len(digits) in (4, 6, 8, 10, 12):
+                res = parse_smart_datetime_windows(
+                    token,
+                    tolerance_minutes=tolerance_minutes,
+                    reference_dt=reference_dt,
+                )
+                if res.is_valid and res.windows:
+                    windows.extend(res.windows)
+                    date_descs.append(res.status_text.removeprefix("條件："))
+                    continue
+        keywords.append(token)
+
+    status_parts: list[str] = []
+    if date_descs:
+        status_parts.append(f"日期時間：{'；'.join(date_descs)}")
+    if keywords:
+        status_parts.append(f"關鍵字：{', '.join(keywords)}")
+
+    prefix = "智慧辨識｜" if date_descs else ""
+    return UnifiedReportQuery(
+        keywords=tuple(keywords),
+        time_windows=tuple(windows),
+        status_text=f"{prefix}{' ｜ '.join(status_parts)}",
+        has_datetime_filter=bool(windows),
+    )
+
+
+def filter_archive_report_records(
+    records: Sequence[ArchiveReportRecord],
+    *,
+    vendor: str | None = None,
+    keyword: str = "",
+    keywords: Sequence[str] | None = None,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+    time_windows: Sequence[tuple[datetime, datetime]] | None = None,
+) -> list[ArchiveReportRecord]:
+    """依廠商、關鍵字與指定收件日期時間區間篩選報表紀錄。"""
+    kw_tokens = [k.strip().lower() for k in (keywords or ()) if k.strip()]
+    if keyword.strip():
+        kw_tokens.append(keyword.strip().lower())
+
+    result: list[ArchiveReportRecord] = []
+    for rec in records:
+        if vendor and rec.vendor != vendor:
+            continue
+        if time_windows:
+            if rec.received_dt is None or not any(
+                w_start <= rec.received_dt <= w_end for w_start, w_end in time_windows
+            ):
+                continue
+        if start_dt is not None and (rec.received_dt is None or rec.received_dt < start_dt):
+            continue
+        if end_dt is not None and (rec.received_dt is None or rec.received_dt > end_dt):
+            continue
+        if kw_tokens:
+            haystack = f"{rec.vendor} {rec.batch_label} {rec.filename} {rec.saved_path}".lower()
+            if not all(tok in haystack for tok in kw_tokens):
+                continue
+        result.append(rec)
+    return result
+
+
+def group_report_by_vendor_date(
+    records: Sequence[ArchiveReportRecord],
+) -> list[tuple[str, list[tuple[str, datetime | None, list[ArchiveReportRecord]]]]]:
+    """依廠商與收件日期時間批次分組，並由新到舊排序。"""
+    by_vendor: dict[str, dict[str, list[ArchiveReportRecord]]] = {}
+    for rec in records:
+        by_vendor.setdefault(rec.vendor, {}).setdefault(rec.batch_label, []).append(rec)
+
+    grouped_vendors: list[
+        tuple[datetime, str, list[tuple[str, datetime | None, list[ArchiveReportRecord]]]]
+    ] = []
+    for vendor, batches_map in by_vendor.items():
+        sorted_batches: list[tuple[str, datetime | None, list[ArchiveReportRecord]]] = []
+        latest_vendor_dt = datetime.min
+        for batch_label, items in batches_map.items():
+            batch_dt = max((item.received_dt for item in items if item.received_dt is not None), default=None)
+            if batch_dt is not None and batch_dt > latest_vendor_dt:
+                latest_vendor_dt = batch_dt
+            sorted_items = sorted(items, key=lambda item: item.filename.lower())
+            sorted_batches.append((batch_label, batch_dt, sorted_items))
+
+        sorted_batches.sort(
+            key=lambda b: (b[1] or datetime.min, b[0]),
+            reverse=True,
+        )
+        grouped_vendors.append((latest_vendor_dt, vendor, sorted_batches))
+
+    grouped_vendors.sort(key=lambda v: (v[0], v[1]), reverse=True)
+    return [(vendor, batches) for _, vendor, batches in grouped_vendors]
+
+
 # ==============================================================================
 # Outlook COM 操作區
 # ==============================================================================
@@ -699,6 +1042,247 @@ def _extract_mail_body(mail: Any, logger: logging.Logger) -> str:
         return ""
 
 
+def _extract_mail_html_body(mail: Any, logger: logging.Logger) -> str:
+    """安全讀取郵件 HTML 內文。"""
+    try:
+        return str(getattr(mail, "HTMLBody", "") or "")
+    except Exception as exc:
+        logger.warning("讀取郵件 HTML 內文失敗（將改用純文字）：%s", exc)
+        return ""
+
+
+_SCRIPT_TAG_RE = re.compile(r"<script\b[^>]*>.*?</script>", re.IGNORECASE | re.DOTALL)
+_STYLE_TAG_RE = re.compile(r"<style\b[^>]*>.*?</style>", re.IGNORECASE | re.DOTALL)
+_BODY_TAG_RE = re.compile(r"<body\b[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL)
+
+
+def build_yahoo_search_query(
+    *,
+    sender_email: str,
+    sender_name: str,
+    subject: str,
+    attachment_names: Sequence[str] = (),
+) -> str:
+    """組合 Yahoo Mail 搜尋字串（以寄件人為主，搭配主旨或第一個附件檔名）。"""
+    parts: list[str] = []
+    if sender_email:
+        parts.append(f"from:{sender_email.strip()}")
+    elif sender_name:
+        parts.append(f"from:{sender_name.strip()}")
+
+    clean_subj = (subject or "").strip()
+    if clean_subj and clean_subj != "(無主旨)":
+        parts.append(clean_subj)
+    elif attachment_names:
+        parts.append(attachment_names[0])
+    return " ".join(parts)
+
+
+def build_yahoo_search_url(query: str) -> str:
+    """產生新版 Yahoo Mail (/n/) 網頁版搜尋連結。
+
+    新版 Yahoo Mail SPA 路徑段對關鍵字採兩層 URL 編碼（例如 '@' -> '%2540'）。
+    """
+    cleaned = query.strip()
+    if not cleaned:
+        return "https://mail.yahoo.com/"
+    encoded_twice = quote(quote(cleaned, safe=""), safe="")
+    return f"https://mail.yahoo.com/n/search/keyword={encoded_twice}?.src=ym"
+
+
+def build_email_html_document(
+    *,
+    subject: str,
+    sender_name: str,
+    sender_email: str,
+    received_dt: datetime | None,
+    matched_reason: str,
+    attachment_names: Sequence[str],
+    body_text: str = "",
+    html_body: str = "",
+    message_id: str = "",
+) -> str:
+    """組合含信件中繼資料摘要、Yahoo Mail 快速搜尋連結與安全內文的單一 UTF-8 HTML 檔案。"""
+    received_str = received_dt.strftime("%Y-%m-%d %H:%M:%S") if received_dt else "未知"
+    if sender_name and sender_email:
+        sender_display = f"{html.escape(sender_name)} &lt;{html.escape(sender_email)}&gt;"
+    elif sender_email:
+        sender_display = html.escape(sender_email)
+    else:
+        sender_display = html.escape(sender_name or "未知")
+
+    att_items = "".join(f"<li>{html.escape(name)}</li>" for name in attachment_names) or "<li>(無)</li>"
+
+    search_query = build_yahoo_search_query(
+        sender_email=sender_email,
+        sender_name=sender_name,
+        subject=subject,
+        attachment_names=attachment_names,
+    )
+    yahoo_search_url = build_yahoo_search_url(search_query)
+    safe_query = html.escape(search_query)
+    safe_msg_id = html.escape(message_id)
+
+    cleaned_html = _SCRIPT_TAG_RE.sub("", html_body or "").strip()
+    extracted_styles = ""
+    if cleaned_html:
+        styles = _STYLE_TAG_RE.findall(cleaned_html)
+        if styles:
+            extracted_styles = "\n".join(styles)
+        body_match = _BODY_TAG_RE.search(cleaned_html)
+        body_fragment = body_match.group(1) if body_match else cleaned_html
+    else:
+        escaped_text = html.escape(body_text or "(無內文)")
+        body_fragment = f'<pre class="plain-body">{escaped_text}</pre>'
+
+    safe_subject = html.escape(subject or "(無主旨)")
+    safe_reason = html.escape(matched_reason)
+    msg_id_row = f"<tr><th>Message-ID</th><td><code>{safe_msg_id}</code></td></tr>" if safe_msg_id else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <title>{safe_subject}</title>
+  <style>
+    body {{
+      font-family: "Microsoft JhengHei UI", "Segoe UI", sans-serif;
+      background-color: #f8fafc;
+      color: #1e293b;
+      margin: 24px;
+      line-height: 1.6;
+    }}
+    .meta-card {{
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-left: 5px solid #2563eb;
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 20px;
+    }}
+    .meta-card h1 {{
+      font-size: 18px;
+      margin: 0 0 12px 0;
+      color: #0f172a;
+    }}
+    .meta-table {{
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 14px;
+    }}
+    .meta-table th {{
+      text-align: left;
+      color: #475569;
+      width: 108px;
+      padding: 4px 8px 4px 0;
+      vertical-align: top;
+    }}
+    .meta-table td {{
+      padding: 4px 0;
+      word-break: break-word;
+    }}
+    .att-list {{
+      margin: 0;
+      padding-left: 18px;
+    }}
+    .action-bar {{
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #e2e8f0;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }}
+    .yahoo-btn {{
+      display: inline-block;
+      background-color: #6001d2;
+      color: #ffffff;
+      text-decoration: none;
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+    }}
+    .yahoo-btn:hover {{
+      background-color: #4c00a8;
+    }}
+    .copy-btn {{
+      background-color: #f1f5f9;
+      color: #1e293b;
+      border: 1px solid #cbd5e1;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+    }}
+    .copy-btn:hover {{
+      background-color: #e2e8f0;
+    }}
+    .query-pill {{
+      background-color: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 12px;
+      color: #334155;
+    }}
+    .mail-body {{
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 20px;
+      overflow-x: auto;
+    }}
+    .plain-body {{
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: inherit;
+      margin: 0;
+    }}
+  </style>
+  {extracted_styles}
+</head>
+<body>
+  <section class="meta-card">
+    <h1>{safe_subject}</h1>
+    <table class="meta-table">
+      <tr><th>寄件人</th><td>{sender_display}</td></tr>
+      <tr><th>收件時間</th><td>{html.escape(received_str)}</td></tr>
+      <tr><th>命中規則</th><td>{safe_reason}</td></tr>
+      {msg_id_row}
+      <tr><th>歸檔附件</th><td><ul class="att-list">{att_items}</ul></td></tr>
+    </table>
+    <div class="action-bar">
+      <a class="yahoo-btn" href="{html.escape(yahoo_search_url)}" target="_blank" rel="noopener noreferrer">在 Yahoo Mail 搜尋此信</a>
+      <button type="button" class="copy-btn" id="copyQueryBtn">複製搜尋關鍵字</button>
+      <code class="query-pill" id="yahooQueryText">{safe_query}</code>
+    </div>
+  </section>
+  <section class="mail-body">
+    {body_fragment}
+  </section>
+  <script>
+    (function () {{
+      var btn = document.getElementById("copyQueryBtn");
+      var qEl = document.getElementById("yahooQueryText");
+      if (!btn || !qEl) return;
+      btn.addEventListener("click", function () {{
+        var text = qEl.textContent || "";
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(text).then(function () {{
+            btn.textContent = "已複製";
+            setTimeout(function () {{ btn.textContent = "複製搜尋關鍵字"; }}, 1800);
+          }});
+        }}
+      }});
+    }})();
+  </script>
+</body>
+</html>
+"""
+
+
 def build_target_dir(
     output_root: Path,
     target_folder: str,
@@ -733,6 +1317,8 @@ def process_mailbox(
     duplicate_mode: str = DUPLICATE_FILENAME_MODE,
     use_datetime_subfolder: bool = USE_DATETIME_SUBFOLDER,
     datetime_format: str = DATETIME_SUBFOLDER_FORMAT,
+    save_email_html: bool = SAVE_EMAIL_HTML,
+    email_html_filename: str = EMAIL_HTML_FILENAME,
     cancel_requested: Callable[[], bool] | None = None,
     progress_callback: Callable[[dict[str, int], str], None] | None = None,
 ) -> dict[str, int]:
@@ -828,6 +1414,8 @@ def process_mailbox(
 
             valid_saved_in_mail = 0
             all_already_downloaded = True
+            mail_dest_dir: Path | None = None
+            saved_filenames_in_mail: list[str] = []
 
             for idx, att, raw_filename, att_size in valid_attachments:
                 attachment_key = f"{idx}:{raw_filename}:{att_size}"
@@ -843,6 +1431,7 @@ def process_mailbox(
                     use_datetime_subfolder=use_datetime_subfolder,
                     datetime_format=datetime_format,
                 )
+                mail_dest_dir = dest_dir
                 dest_path = resolve_unique_path(
                     dest_dir,
                     raw_filename,
@@ -861,6 +1450,7 @@ def process_mailbox(
                     )
                     valid_saved_in_mail += 1
                     stats["saved_attachments"] += 1
+                    saved_filenames_in_mail.append(dest_path.name)
                 else:
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     att.SaveAsFile(str(dest_path.resolve()))
@@ -880,6 +1470,37 @@ def process_mailbox(
                     )
                     valid_saved_in_mail += 1
                     stats["saved_attachments"] += 1
+                    saved_filenames_in_mail.append(dest_path.name)
+
+            if save_email_html and valid_saved_in_mail > 0 and mail_dest_dir is not None:
+                html_dest = resolve_unique_path(
+                    mail_dest_dir,
+                    email_html_filename,
+                    received_dt=received_dt,
+                    mode=duplicate_mode,
+                )
+                if dry_run:
+                    logger.info("[DRY-RUN] 預計產生信件紀錄：%s", html_dest)
+                else:
+                    display_msg_id = (
+                        ""
+                        if message_key.startswith(("entry:", "fallback:"))
+                        else message_key
+                    )
+                    html_content = build_email_html_document(
+                        subject=subject,
+                        sender_name=sender_name,
+                        sender_email=sender_email,
+                        received_dt=received_dt,
+                        matched_reason=reason,
+                        attachment_names=saved_filenames_in_mail,
+                        body_text=_extract_mail_body(item, logger),
+                        html_body=_extract_mail_html_body(item, logger),
+                        message_id=display_msg_id,
+                    )
+                    mail_dest_dir.mkdir(parents=True, exist_ok=True)
+                    html_dest.write_text(html_content, encoding="utf-8")
+                    logger.info("已產生信件紀錄：%s", html_dest)
 
             if not dry_run and (valid_saved_in_mail > 0 or all_already_downloaded):
                 status = "downloaded" if valid_saved_in_mail > 0 else "no_valid_attachments"

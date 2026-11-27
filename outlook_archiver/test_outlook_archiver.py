@@ -91,6 +91,7 @@ class DummyMailItem:
         entry_id: str = "entry-1",
         item_class: int = oa.OL_MAIL,
         body: str = "",
+        html_body: str = "",
     ) -> None:
         self.Class = item_class
         self.Subject = subject
@@ -102,6 +103,7 @@ class DummyMailItem:
         self.Attachments = DummyAttachments(attachments)
         self.EntryID = entry_id
         self.Body = body
+        self.HTMLBody = html_body
         props: dict[str, object] = {}
         if internet_id:
             props[oa.PR_INTERNET_MESSAGE_ID] = internet_id
@@ -433,6 +435,206 @@ class TestOutlookArchiver(unittest.TestCase):
                 self.assertFalse(store.is_message_checked("m1"))
             finally:
                 store.close()
+
+    def test_build_and_save_email_html_record_in_subfolder(self) -> None:
+        doc = oa.build_email_html_document(
+            subject="合宏展 <測試> 主旨",
+            sender_name="林先生",
+            sender_email="lin@hhj.com.tw",
+            received_dt=datetime(2026, 11, 27, 9, 10, 5),
+            matched_reason="主旨包含 '合宏展'",
+            attachment_names=["part1.dwg"],
+            body_text="備用純文字",
+            html_body="<html><body><p>你好，請看圖檔</p><script>alert(1)</script></body></html>",
+            message_id="<abc123@mail.gmail.com>",
+        )
+        self.assertIn("合宏展 &lt;測試&gt; 主旨", doc)
+        self.assertIn("lin@hhj.com.tw", doc)
+        self.assertIn("你好，請看圖檔", doc)
+        self.assertNotIn("alert(1)", doc)
+        self.assertIn("https://mail.yahoo.com/n/search/keyword=", doc)
+        self.assertIn("from:lin@hhj.com.tw", doc)
+        self.assertIn("&lt;abc123@mail.gmail.com&gt;", doc)
+
+        url_exact = oa.build_yahoo_search_url("ming.tzee@gmail.com")
+        self.assertEqual(
+            url_exact,
+            "https://mail.yahoo.com/n/search/keyword=ming.tzee%2540gmail.com?.src=ym",
+        )
+
+        q_no_subj = oa.build_yahoo_search_query(
+            sender_email="ming.tzee@gmail.com",
+            sender_name="明澤高建平",
+            subject="(無主旨)",
+            attachment_names=["A050-407A.dwg"],
+        )
+        self.assertEqual(q_no_subj, "from:ming.tzee@gmail.com A050-407A.dwg")
+
+        rules = [oa.ClassificationRule("合宏展", ("合宏展",), (), (), (), ())]
+        logger = logging.getLogger("test_archiver_html")
+        logger.handlers.clear()
+        logger.addHandler(logging.NullHandler())
+
+        same_minute = datetime.now().replace(hour=9, minute=30, second=0, microsecond=0)
+        expected_sub = same_minute.strftime("%Y-%m-%d_%p%I%M")
+        mails = [
+            DummyMailItem(
+                subject="合宏展 第一封",
+                sender_name="林先生",
+                sender_email="lin@hhj.com.tw",
+                internet_id="<html-1@example.com>",
+                attachments=[DummyAttachment("p1.dwg", 10240)],
+                received_time=same_minute,
+                body="第一封純文字內文",
+            ),
+            DummyMailItem(
+                subject="合宏展 第二封",
+                sender_name="林先生",
+                sender_email="lin@hhj.com.tw",
+                internet_id="<html-2@example.com>",
+                attachments=[DummyAttachment("p2.dwg", 10240)],
+                received_time=same_minute,
+                html_body="<html><body><b>第二封 HTML 內文</b></body></html>",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = oa.StateStore(root / "state.db")
+            try:
+                oa.process_mailbox(
+                    DummyFolder(mails),
+                    rules,
+                    store,
+                    root / "out",
+                    logger,
+                    dry_run=True,
+                    days_back=14,
+                    save_email_html=True,
+                )
+                self.assertFalse((root / "out" / "合宏展").exists())
+
+                oa.process_mailbox(
+                    DummyFolder(mails),
+                    rules,
+                    store,
+                    root / "out",
+                    logger,
+                    dry_run=False,
+                    days_back=14,
+                    save_email_html=True,
+                )
+                sub_dir = root / "out" / "合宏展" / expected_sub
+                html1 = sub_dir / oa.EMAIL_HTML_FILENAME
+                html2 = sub_dir / "_信件內容_1.html"
+                self.assertTrue(html1.exists())
+                self.assertTrue(html2.exists())
+                self.assertIn("第一封純文字內文", html1.read_text(encoding="utf-8"))
+                self.assertIn("第二封 HTML 內文", html2.read_text(encoding="utf-8"))
+            finally:
+                store.close()
+
+    def test_archive_report_grouping_and_datetime_filter(self) -> None:
+        rows = [
+            ("2026-11-27T10:01:52", "單井", r"d:\圖檔\CAD\單井\2026-11-20_PM0346\訂單1.pdf"),
+            ("2026-11-27T10:01:51", "良俥", r"d:\圖檔\CAD\良俥\2026-11-23_AM0943\B.dwg"),
+            ("2026-11-27T10:01:50", "良俥", r"d:\圖檔\CAD\良俥\2026-11-23_AM0943\A.dwg"),
+            ("2026-11-27T10:01:49", "合宏展", r"d:\圖檔\CAD\合宏展\2026-11-25_AM1000\C.dwg"),
+        ]
+        records = oa.build_archive_report_records(rows)
+        self.assertEqual(len(records), 4)
+        self.assertEqual(records[0].received_dt, datetime(2026, 11, 20, 15, 46))
+        self.assertEqual(records[1].received_dt, datetime(2026, 11, 23, 9, 43))
+
+        # 依日期時間範圍篩選
+        filtered_dt = oa.filter_archive_report_records(
+            records,
+            start_dt=datetime(2026, 11, 23, 9, 0),
+            end_dt=datetime(2026, 11, 23, 12, 0),
+        )
+        self.assertEqual(len(filtered_dt), 2)
+        self.assertTrue(all(r.vendor == "良俥" for r in filtered_dt))
+
+        # 依廠商與關鍵字篩選
+        filtered_kw = oa.filter_archive_report_records(records, vendor="良俥", keyword="B.dwg")
+        self.assertEqual(len(filtered_kw), 1)
+        self.assertEqual(filtered_kw[0].filename, "B.dwg")
+
+        # 依廠商 - 日期批次分組（最新廠商與批次排前面）
+        grouped = oa.group_report_by_vendor_date(records)
+        self.assertEqual([v for v, _ in grouped], ["合宏展", "良俥", "單井"])
+        self.assertEqual([r.filename for r in grouped[1][1][0][2]], ["A.dwg", "B.dwg"])
+
+    def test_smart_numeric_datetime_search_windows(self) -> None:
+        ref = datetime(2026, 11, 27, 10, 0)
+        rows = [
+            ("2026-11-27T10:00:00", "單井", r"d:\圖檔\CAD\單井\2026-10-22_PM0242\pm242.dwg"),
+            ("2026-11-27T10:00:00", "單井", r"d:\圖檔\CAD\單井\2026-10-22_PM0236\pm236.dwg"),
+            ("2026-11-27T10:00:00", "單井", r"d:\圖檔\CAD\單井\2026-10-22_AM0240\am240.dwg"),
+            ("2026-11-27T10:00:00", "單井", r"d:\圖檔\CAD\單井\2026-10-22_PM0250\pm250.dwg"),
+        ]
+        records = oa.build_archive_report_records(rows)
+
+        # 12 碼含 AM/PM 智慧比對：202610220240 應命中 02:40±5分 與 14:40±5分（pm242, pm236, am240），排除 pm250
+        res12 = oa.parse_smart_datetime_windows("202610220240", tolerance_minutes=5, reference_dt=ref)
+        self.assertTrue(res12.is_valid)
+        hit12 = oa.filter_archive_report_records(records, time_windows=res12.windows)
+        self.assertEqual({r.filename for r in hit12}, {"pm242.dwg", "pm236.dwg", "am240.dwg"})
+
+        # 8 碼省略年 (12H 制)：10220240 結果應相同
+        res8_ampm = oa.parse_smart_datetime_windows("10220240", tolerance_minutes=5, reference_dt=ref)
+        self.assertTrue(res8_ampm.is_valid)
+        hit8_ampm = oa.filter_archive_report_records(records, time_windows=res8_ampm.windows)
+        self.assertEqual({r.filename for r in hit8_ampm}, {"pm242.dwg", "pm236.dwg", "am240.dwg"})
+
+        # 8 碼省略年 (24H 制)：10221440 只命中 PM 14:40±5分（pm242, pm236），不命中 AM 02:40
+        res8_24h = oa.parse_smart_datetime_windows("10221440", tolerance_minutes=5, reference_dt=ref)
+        self.assertTrue(res8_24h.is_valid)
+        hit8_24h = oa.filter_archive_report_records(records, time_windows=res8_24h.windows)
+        self.assertEqual({r.filename for r in hit8_24h}, {"pm242.dwg", "pm236.dwg"})
+
+        # 8 碼整日 YYYYMMDD 與 4 碼 MMDD：20261022 / 1022 命中全天 4 筆
+        res_day = oa.parse_smart_datetime_windows("20261022", reference_dt=ref)
+        self.assertTrue(res_day.is_valid)
+        self.assertEqual(len(oa.filter_archive_report_records(records, time_windows=res_day.windows)), 4)
+
+        res_mmdd = oa.parse_smart_datetime_windows("1022", reference_dt=ref)
+        self.assertTrue(res_mmdd.is_valid)
+        self.assertEqual(len(oa.filter_archive_report_records(records, time_windows=res_mmdd.windows)), 4)
+
+        # 未輸入完的數字應標為 is_valid=False 且不崩潰
+        res_partial = oa.parse_smart_datetime_windows("2026102", reference_dt=ref)
+        self.assertFalse(res_partial.is_valid)
+
+    def test_unified_report_query_mixed_keywords_and_datetime(self) -> None:
+        ref = datetime(2026, 11, 27, 10, 0)
+        rows = [
+            ("2026-11-27T10:00:00", "單井", r"d:\圖檔\CAD\單井\2026-10-22_PM0242\訂單-4070.pdf"),
+            ("2026-11-27T10:00:00", "合宏展", r"d:\圖檔\CAD\合宏展\2026-10-22_PM0241\HHJ-101.dwg"),
+            ("2026-11-27T10:00:00", "單井", r"d:\圖檔\CAD\單井\2026-10-23_AM0900\其他.dwg"),
+        ]
+        records = oa.build_archive_report_records(rows)
+
+        # 混合搜尋：關鍵字 + 省略年 12H 日期時間
+        q1 = oa.parse_unified_report_query("單井 10220240", reference_dt=ref)
+        self.assertEqual(q1.keywords, ("單井",))
+        self.assertTrue(q1.has_datetime_filter)
+        hit1 = oa.filter_archive_report_records(records, keywords=q1.keywords, time_windows=q1.time_windows)
+        self.assertEqual([r.filename for r in hit1], ["訂單-4070.pdf"])
+
+        # 純數字料號 (4070 非合法月日)：應自動判定為關鍵字搜尋
+        q2 = oa.parse_unified_report_query("4070", reference_dt=ref)
+        self.assertFalse(q2.has_datetime_filter)
+        self.assertEqual(q2.keywords, ("4070",))
+        hit2 = oa.filter_archive_report_records(records, keywords=q2.keywords, time_windows=q2.time_windows or None)
+        self.assertEqual([r.filename for r in hit2], ["訂單-4070.pdf"])
+
+        # 帶分隔符的日期時間 '2026-10-22 14:40'
+        q3 = oa.parse_unified_report_query("2026-10-22 14:40", reference_dt=ref)
+        self.assertEqual(q3.keywords, ())
+        self.assertTrue(q3.has_datetime_filter)
+        hit3 = oa.filter_archive_report_records(records, keywords=q3.keywords, time_windows=q3.time_windows)
+        self.assertEqual({r.filename for r in hit3}, {"訂單-4070.pdf", "HHJ-101.dwg"})
 
 
 if __name__ == "__main__":

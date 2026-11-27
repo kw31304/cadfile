@@ -13,7 +13,7 @@ if not exist ".venv\Scripts\pyinstaller.exe" (
     --clean ^
     --onefile ^
     --windowed ^
-    --name "OutlookArchiver_V1.0" ^
+    --name "OutlookArchiver_V1.1" ^
     --version-file "version_info.txt" ^
     --distpath "." ^
     --workpath "build" ^
